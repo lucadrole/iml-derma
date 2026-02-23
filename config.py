@@ -232,8 +232,70 @@ def main():
     )
 
     # Add other arguments as needed
+    
+    # ISIC / classification-specific
+    parser.add_argument(
+        "--data-root", type=str, default="data/isic2019",
+        help="Root folder for ISIC data",
+    )
+    parser.add_argument(
+        "--encoder-type", type=str, default="clip",
+        choices=["clip", "biomedclip"],
+        help="Vision encoder for image embeddings",
+    )
+    parser.add_argument(
+        "--biomedclip-dir", type=str, default="",
+        help="Local BiomedCLIP checkpoint directory",
+    )
+    parser.add_argument(
+        "--n-ways", type=int, default=2,
+        help="Number of classes per episode",
+    )
+    parser.add_argument(
+        "--clip-dim", type=int, default=512,
+        help="Output dimension of CLIP vision encoder",
+    )
+    parser.add_argument(
+        "--knowledge-setup", type=str, default="C",
+        help="Knowledge format (only C implemented)",
+    )
+    parser.add_argument(
+        "--knowledge-mask-rate", type=float, default=0.5,
+        help="Probability of masking knowledge during training",
+    )
+    parser.add_argument(
+        "--n-episodes-train", type=int, default=10000,
+        help="Number of training episodes per epoch",
+    )
+    parser.add_argument(
+        "--n-episodes-val", type=int, default=1000,
+        help="Number of validation episodes",
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=4,
+        help="DataLoader worker processes",
+    )
+    parser.add_argument(
+        "--load-path", type=str, default="",
+        help="Path to pretrained checkpoint (stage 2 training)",
+    )
+    parser.add_argument(
+        "--train-num-z-samples", type=int, default=1,
+        help="Number of z samples during training",
+    )
+    parser.add_argument(
+        "--test-num-z-samples", type=int, default=16,
+        help="Number of z samples during evaluation",
+    )
+
 
     args = parser.parse_args()
+    
+    
+    if not args.biomedclip_dir:
+        args.biomedclip_dir = None
+    if not args.load_path:
+        args.load_path = None
 
     if args.xy_encoder_hidden_dim is None:
         args.xy_encoder_hidden_dim = args.hidden_dim * 3

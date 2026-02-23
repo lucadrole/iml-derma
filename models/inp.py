@@ -9,33 +9,30 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(os.path.join(__file__, os.par
 from models.modules import XYEncoder, LatentEncoder, Decoder, XEncoder
 from models.utils import MultivariateNormalDiag
 
-# Setup C: raw text -> CLIP text encoder -> average pool -> project [N, d]
 class CLIPTextKnowledgeEncoder(nn.Module):
     def __init__(self, clip_model, tokenizer, d, freeze_clip=True):
         super().__init__()
-        self.clip_model = clip_model
         self.tokenizer = tokenizer
-        
-        # Freeze CLIP model parameters
+
+        # Freeze CLIP parameters
         if freeze_clip:
-            for param in self.clip_model.parameters():
+            for param in clip_model.parameters():
                 param.requires_grad = False
-        
+
+        # Store as a non-module reference so it doesn't appear in state_dict
+        # This keeps checkpoint size to just the projection layer (~1MB)
+        self._clip_ref = [clip_model]   # list wrapper prevents nn.Module registration
+
         self.proj = nn.Linear(512, d)
 
     def forward(self, descriptions):
-        """
-        descriptions: list of N strings
-        Returns: [N, d]
-        """
-        # OpenCLIP tokenizer: just pass the list, returns [N, context_length] tensor
-        tokens = self.tokenizer(descriptions).to(next(self.parameters()).device)
-        
-        # encode_text returns [N, 512] directly (not a dict with .last_hidden_state)
-        text_embeds = self.clip_model.encode_text(tokens)  # [N, 512]
-        k = self.proj(text_embeds)  # [N, d]
+        device = self.proj.weight.device
+        clip_model = self._clip_ref[0]
+        tokens = self.tokenizer(descriptions).to(device)
+        with torch.no_grad():
+            text_embeds = clip_model.encode_text(tokens)   # [N, 512]
+        k = self.proj(text_embeds)   # [N, d]
         return k
-
 
 
 class INP(nn.Module):
@@ -141,34 +138,58 @@ class INP(nn.Module):
 
 
 class INP_MedClassification(nn.Module):
-    def __init__(self, config, clip_model, tokenizer):
-        '''
-        Here we assume the clip model is a dual-encoder
-        '''
-        super().__init__()
-        self.config = config
-        self.n_ways = config.n_ways
-        self.d = config.hidden_dim  # 512
-        self.tokenizer = tokenizer
+    """
+    Informed Neural Process for N-way, k-shot image classification.
 
-        # Frozen CLIP vision encoder
-        self.clip_vision = clip_model.visual
-        for param in self.clip_vision.parameters():
-            param.requires_grad = False
+    Expects pre-computed, L2-normalised CLIP/BiomedCLIP image embeddings
+    as input (not raw images). Raw-image encoding is handled offline by
+    dataset/isic.py::build_embedding_cache().
+
+    Forward inputs
+    --------------
+    x_context : Tensor[bs, k*N, clip_dim]   context image embeddings
+    y_context : Tensor[bs, k*N]             episode-local class labels 0..N-1
+                                            (zero-padded when k=0)
+    x_query   : Tensor[bs, Q*N, clip_dim]   query image embeddings
+    y_query   : Tensor[bs, Q*N] | None      labels (None at eval time)
+    knowledge : list[str] of length N | None  class descriptions for this episode
+
+    Forward outputs
+    ---------------
+    logits    : Tensor[n_z, bs, Q*N, N]
+    z_samples : Tensor[n_z, bs, N, d]
+    q_zCc     : MultivariateNormalDiag  posterior given context only
+    q_zCct    : MultivariateNormalDiag | None  posterior given context+target (train only)
+    """
+
+    def __init__(self, config, clip_model, tokenizer):
+        super().__init__()
+        self.n_ways = config.n_ways
+        self.d      = config.hidden_dim   # latent dimension
+
+        # ── Image projection (only trainable image-side component) ────────────
+        # clip_vision is NOT stored here — we use pre-cached embeddings.
+        # image_proj maps frozen CLIP embeddings -> trainable hidden space.
         self.image_proj = nn.Linear(config.clip_dim, self.d)
 
-        # Knowledge encoder (C - just use clip embedding)
-        self.knowledge_encoder = CLIPTextKnowledgeEncoder(clip_model, tokenizer, self.d)
+        # ── Knowledge encoder (Setup C) ───────────────────────────────────────
+        # Frozen CLIP text encoder + trainable linear projection.
+        self.knowledge_encoder = CLIPTextKnowledgeEncoder(
+            clip_model, tokenizer, self.d
+        )
 
-
-        # Aggregator: sum + 2-layer MLP
+        # ── Aggregator: (r + k) -> (mu_z, sigma_z) ───────────────────────────
+        # Input:  [bs, N, d]   (sum of data rep and knowledge rep)
+        # Output: [bs, N, 2d]  (mean and pre-softplus scale of diagonal Gaussian)
         self.aggregator = nn.Sequential(
             nn.Linear(self.d, self.d),
             nn.GELU(),
-            nn.Linear(self.d, 2 * self.d),  # outputs mu and sigma
+            nn.Linear(self.d, 2 * self.d),
         )
 
-        # Decoder: maps z to class weight vectors
+        # ── Decoder: z -> class weight vectors ───────────────────────────────
+        # Input:  [n_z, bs, N, d]
+        # Output: [n_z, bs, N, d]  (one weight vector per class)
         self.decoder = nn.Sequential(
             nn.Linear(self.d, self.d),
             nn.GELU(),
@@ -176,278 +197,113 @@ class INP_MedClassification(nn.Module):
         )
 
         self.train_num_z_samples = config.train_num_z_samples
-        self.test_num_z_samples = config.test_num_z_samples
+        self.test_num_z_samples  = config.test_num_z_samples
 
-    def encode_images(self, images):
-        """images: [bs, num_images, C, H, W] or precomputed CLIP features"""
-        with torch.no_grad():
-            feats = self.clip_vision(images)  # [bs * num_images, clip_dim]
-        return self.image_proj(feats)  # [bs * num_images, d]
+    # ── Sub-components ────────────────────────────────────────────────────────
 
-    def encode_context_per_class(self, x_context, y_context):
+    def encode_context_per_class(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """
-        Aggregate context image embeddings per class.
-        x_context: [bs, k*N, d] image embeddings
-        y_context: [bs, k*N] class labels (0..N-1)
-        Returns: [bs, N, d]
+        Mean-pool projected embeddings per class.
+
+        x : [bs, M, d]   M = k*N (context) or Q*N (query)
+        y : [bs, M]      episode-local labels 0..N-1
+
+        Returns r : [bs, N, d]
+
+        Zero-shot note: when k=0, collate_episodic pads x to shape [bs, 1, d]
+        with zeros and y to all-zeros. The mask for class 0 fires on the padding
+        giving a zero mean (correct), and classes 1..N-1 get count=0 (clamped to
+        1) also giving zero vectors (correct). Downstream infer_latent_dist then
+        receives r=0 and relies on knowledge alone — the intended zero-shot behaviour.
         """
-        bs = x_context.shape[0]
-        r = torch.zeros(bs, self.n_ways, self.d, device=x_context.device)
+        bs = x.shape[0]
+        r  = torch.zeros(bs, self.n_ways, self.d, device=x.device, dtype=x.dtype)
         for c in range(self.n_ways):
-            mask = (y_context == c).unsqueeze(-1)  # [bs, k*N, 1]
-            count = mask.sum(dim=1).clamp(min=1)  # [bs, 1]
-            r[:, c, :] = (x_context * mask).sum(dim=1) / count
-        return r  # [bs, N, d]
+            mask  = (y == c).unsqueeze(-1).float()   # [bs, M, 1]
+            count = mask.sum(dim=1).clamp(min=1)     # [bs, 1]
+            r[:, c, :] = (x * mask).sum(dim=1) / count
+        return r
 
-    def infer_latent_dist(self, r, knowledge):
+    def infer_latent_dist(
+        self, r: torch.Tensor, k: torch.Tensor
+    ) -> "MultivariateNormalDiag":
         """
-        r: [bs, N, d] data representation
-        knowledge: [bs, N, d] knowledge representation (or zeros)
-        Returns: diagonal Gaussian over z of shape [bs, N, d]
+        r : [bs, N, d]  data representation
+        k : [bs, N, d]  knowledge representation (zeros if masked)
+
+        Returns diagonal Gaussian q(z) with mean and scale [bs, N, d].
         """
-        combined = r + knowledge  # sum aggregation
-        stats = self.aggregator(combined)  # [bs, N, 2*d]
+        combined  = F.relu(r + k)            # relu matches original LatentEncoder
+        stats     = self.aggregator(combined) # [bs, N, 2d]
         mu, scale_raw = stats.split(self.d, dim=-1)
         scale = 0.01 + 0.99 * F.softplus(scale_raw)
         return MultivariateNormalDiag(mu, scale)
 
-    def decode(self, x_query, z_samples):
+    def decode(self, x_query: torch.Tensor, z_samples: torch.Tensor) -> torch.Tensor:
         """
-        x_query: [bs, num_query, d] CLIP embeddings of query images
-        z_samples: [n_samples, bs, N, d]
-        Returns: logits [n_samples, bs, num_query, N]
+        Compute class logits via inner product between query embeddings
+        and decoded class weight vectors.
+
+        x_query   : [bs, Q*N, d]
+        z_samples : [n_z, bs, N, d]
+
+        Returns logits : [n_z, bs, Q*N, N]
         """
-        # z_samples -> weight vectors per class
-        W = self.decoder(z_samples)  # [n_samples, bs, N, d]
-        # x_query: [bs, num_query, d] -> [1, bs, num_query, d]
-        x_q = x_query.unsqueeze(0)
-        # logits = -x_query @ W^T -> [n_samples, bs, num_query, N]
-        logits = -torch.einsum('sbqd,sbnd->sbqn', x_q, W)
+        W   = self.decoder(z_samples)              # [n_z, bs, N, d]
+        x_q = x_query.unsqueeze(0)                 # [1,   bs, Q*N, d]
+        # positive inner product: higher similarity -> higher logit
+        logits = torch.einsum('sbqd,sbnd->sbqn', x_q, W)
         return logits
 
-    def forward(self, x_context, y_context, x_query, y_query=None,
-                knowledge=None):
-        # Encode context images per class
-        r_C = self.encode_context_per_class(x_context, y_context)
+    # ── Forward ───────────────────────────────────────────────────────────────
 
-        # Handle missing context (zero-shot)
-        if x_context.shape[1] == 0:
-            r_C = torch.zeros_like(r_C)
+    def forward(
+        self,
+        x_context: torch.Tensor,
+        y_context: torch.Tensor,
+        x_query:   torch.Tensor,
+        y_query:   torch.Tensor = None,
+        knowledge: list         = None,
+    ):
+        # ── 1. Project CLIP embeddings into hidden space ──────────────────────
+        # This is the only trainable transformation on the image side.
+        # Must be applied before any aggregation or decoding.
+        x_context = self.image_proj(x_context)   # [bs, k*N, d]
+        x_query   = self.image_proj(x_query)     # [bs, Q*N, d]
 
-        # Knowledge embedding (zeros if not available)
+        # ── 2. Per-class aggregation of context embeddings ────────────────────
+        r_C = self.encode_context_per_class(x_context, y_context)  # [bs, N, d]
+
+        # ── 3. Knowledge embedding ────────────────────────────────────────────
         if knowledge is not None:
-            k = self.knowledge_encoder(knowledge)  # [N, d]
-            # Class descriptions are shared across the batch → expand to [bs, N, d]
-            if k.dim() == 2:
-                k = k.unsqueeze(0).expand(r_C.shape[0], -1, -1)
+            k = self.knowledge_encoder(knowledge)        # [N, d]
+            k = k.unsqueeze(0).expand(r_C.shape[0], -1, -1)  # [bs, N, d]
         else:
             k = torch.zeros_like(r_C)
 
-        # Latent distribution from context + knowledge
+        # ── 4. Latent posterior given context (+ knowledge) ───────────────────
         q_zCc = self.infer_latent_dist(r_C, k)
 
-        # During training, also condition on targets
+        # ── 5. During training: latent posterior given context + target ───────
         if y_query is not None and self.training:
-            r_T = self.encode_context_per_class(x_query, y_query)
+            r_T    = self.encode_context_per_class(x_query, y_query)  # [bs, N, d]
             q_zCct = self.infer_latent_dist(r_T, k)
             sampling_dist = q_zCct
         else:
-            q_zCct = None
+            q_zCct        = None
             sampling_dist = q_zCc
 
-        # Sample z
-        n_samples = self.train_num_z_samples if self.training \
+        # ── 6. Sample latent variable ─────────────────────────────────────────
+        n_samples = (
+            self.train_num_z_samples if self.training
             else self.test_num_z_samples
-        z_samples = sampling_dist.rsample([n_samples])
+        )
+        z_samples = sampling_dist.rsample([n_samples])  # [n_z, bs, N, d]
 
-        # Decode to class logits
-        logits = self.decode(x_query, z_samples)
+        # ── 7. Decode to class logits ─────────────────────────────────────────
+        logits = self.decode(x_query, z_samples)        # [n_z, bs, Q*N, N]
 
         return logits, z_samples, q_zCc, q_zCct
 
 
-if __name__ == "__main__":
-    from argparse import Namespace
-    from loss import ELBOLoss
-    from dataset.utils import get_dataloader
-    #from dataset.datasets import SetKnowledgeTrendingSinusoids
-    import numpy as np
-    import random
-    import json
 
-    # ========== Test CLIPTextKnowledgeEncoder ==========
-    print("=" * 60)
-    print("Testing CLIPTextKnowledgeEncoder with BiomedCLIP")
-    print("=" * 60)
-    
-    from open_clip import create_model_and_transforms, get_tokenizer
-    from open_clip.factory import HF_HUB_PREFIX, _MODEL_CONFIGS
-    
-    # Load BiomedCLIP from local files (same as lab notebook)
-    LOCAL_DIR = "/home/ldrole/my_space/work/cam_phd/checkpoints/biomedclip"
-    MODEL_NAME = "biomedclip_local"
-    
-    with open(f"{LOCAL_DIR}/open_clip_config.json", "r") as f:
-        clip_config = json.load(f)
-        model_cfg = clip_config["model_cfg"]
-        preprocess_cfg = clip_config["preprocess_cfg"]
-    
-    # Register the model config
-    if (not MODEL_NAME.startswith(HF_HUB_PREFIX)
-        and MODEL_NAME not in _MODEL_CONFIGS
-        and clip_config is not None):
-        _MODEL_CONFIGS[MODEL_NAME] = model_cfg
-    
-    tokenizer = get_tokenizer(MODEL_NAME)
-    clip_model, _, preprocess = create_model_and_transforms(
-        model_name=MODEL_NAME,
-        pretrained=f"{LOCAL_DIR}/open_clip_pytorch_model.bin",
-        **{f"image_{k}": v for k, v in preprocess_cfg.items()},
-    )
-    
-    clip_model.eval()
-    
-    # Create knowledge encoder (project 512 -> 128)
-    knowledge_encoder = CLIPTextKnowledgeEncoder(clip_model, tokenizer, d=128)
-    knowledge_encoder.eval()
-    
-    # Verify CLIP model is frozen
-    print("\nVerifying frozen parameters:")
-    clip_params_frozen = 0
-    clip_params_total = 0
-    trainable_params = []
-    
-    for name, param in knowledge_encoder.named_parameters():
-        if 'clip_model' in name:
-            clip_params_total += 1
-            if not param.requires_grad:
-                clip_params_frozen += 1
-        elif param.requires_grad:
-            trainable_params.append(name)
-    
-    print(f"  CLIP params frozen: {clip_params_frozen}/{clip_params_total}")
-    print(f"  Trainable params: {trainable_params}")
-    assert clip_params_frozen == clip_params_total, "CLIP model not fully frozen!"
-    print("✓ CLIP model successfully frozen\n")
-    
-    # Test with sample medical descriptions
-    descriptions = [
-        "A dermatoscopy image of melanoma",
-        "A dermatoscopy image of basal cell carcinoma",
-        "A dermatoscopy image of benign nevus",
-    ]
-    
-    print(f"\nInput: {len(descriptions)} descriptions")
-    with torch.no_grad():
-        knowledge_embeds = knowledge_encoder(descriptions)
-    
-    print(f"Output shape: {knowledge_embeds.shape}")
-    print(f"Expected: [{len(descriptions)}, 128]")
-    assert knowledge_embeds.shape == (len(descriptions), 128), "Shape mismatch!"
-    print("✓ CLIPTextKnowledgeEncoder test passed!\n")
-    
-    # ========== Test INP_MedClassification forward pass ==========
-    print("=" * 60)
-    print("Testing INP_MedClassification forward pass")
-    print("=" * 60)
-    
-    med_config = Namespace(
-        n_ways=3,
-        hidden_dim=128,
-        clip_dim=512,
-        train_num_z_samples=1,
-        test_num_z_samples=4,
-    )
-    
-    med_model = INP_MedClassification(med_config, clip_model, tokenizer)
-    med_model.train()
-    
-    bs, k_shot, n_ways, d = 2, 5, 3, 128
-    x_context = torch.randn(bs, k_shot * n_ways, d)
-    y_context = torch.cat([torch.full((bs, k_shot), c) for c in range(n_ways)], dim=1).long()
-    x_query = torch.randn(bs, 10, d) # 10 encoded query images
-    y_query = torch.randint(0, n_ways, (bs, 10))
-    
-    knowledge = ["melanoma", "basal cell carcinoma", "benign nevus"]
-    
-    logits, z_samples, q_zCc, q_zCct = med_model(x_context, y_context, x_query, y_query, knowledge)
-    
-    
-    print(f"  logits     : {logits.shape}    (n_z_samples, bs, num_query, n_ways)") # numquery: number of images
-    print(f"  z_samples  : {z_samples.shape}")
-    print(f"  q(z|C) loc : {q_zCc.mean.shape}")
-    print(f"  q(z|C,T)   : {q_zCct.mean.shape}")
-    assert logits.shape == (1, bs, 10, n_ways), f"Expected (1, {bs}, 10, {n_ways}), got {logits.shape}"
-    print("✓ INP_MedClassification forward pass test passed!\n")
-    
-    # ========== Test INP (original) ==========
-    # print("=" * 60)
-    # print("Testing INP model")
-    # print("=" * 60)
-    
-    # config = Namespace(
-    #     # model
-    #     input_dim=1,
-    #     output_dim=1,
-    #     xy_encoder_num_hidden=2,
-    #     xy_encoder_hidden_dim=128,
-    #     data_agg_func="mean",
-    #     latent_encoder_num_hidden=2,
-    #     decoder_hidden_dim=64,
-    #     decoder_num_hidden=2,
-    #     decoder_activation="gelu",
-    #     hidden_dim=128,
-    #     x_transf_dim=128,
-    #     x_encoder_num_hidden=1,
-    #     test_num_z_samples=32,
-    #     train_num_z_samples=1,
-    #     knowledge_extractor_num_hidden=0,
-    #     knowledge_dropout=0,
-    #     knowledge_dim=128,
-    #     knowledge_merge="sum",
-    #     text_encoder="set",
-    #     use_knowledge=True,
-    #     freeze_llm=True,
-    #     tune_llm_layer_norms=False,
-    #     # dataset
-    #     batch_size=64,
-    #     min_num_context=1,
-    #     max_num_context=30,
-    #     x_sampler="uniform",
-    #     noise=0,
-    #     # reproducibility
-    #     seed=44,
-    #     dataset="set-trending-sinusoids",
-    #     num_targets=50,
-    # )
-    # config.device = "cpu"
-
-    # dataset = SetKnowledgeTrendingSinusoids(split="train", knowledge_type="abc2")
-    # train_dataloader = get_dataloader(dataset, config)
-    # config.knowledge_input_dim = dataset.knowledge_input_dim
-
-    # model = INP(config)
-    # loss_func = ELBOLoss()
-
-    # torch.manual_seed(config.seed)
-    # np.random.seed(config.seed)
-    # random.seed(config.seed)
-
-    # for i, batch in enumerate(train_dataloader):
-    #     print(i)
-    #     context, target, knowledge, _ = batch
-    #     x_context, y_context = context
-    #     x_target, y_target = target
-
-    #     if config.use_knowledge:
-    #         outputs = model(x_context, y_context, x_target, y_target, knowledge)
-    #     else:
-    #         outputs = model(x_context, y_context, x_target, y_target, None)
-
-    #     print(y_target.shape)
-    #     p_yCc = outputs[0]
-    #     print(p_yCc.mean.shape)
-
-    #     loss = loss_func(outputs, y_target)
-
-    #     print(loss)
