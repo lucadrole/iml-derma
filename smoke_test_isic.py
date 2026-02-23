@@ -104,8 +104,10 @@ assert x_qry.shape == (BATCH_SIZE, 20 * N_WAYS, CLIP_DIM), \
     f"query shape wrong: {x_qry.shape}"
 assert y_qry.shape == (BATCH_SIZE, 20 * N_WAYS), \
     f"y_query shape wrong: {y_qry.shape}"
-assert isinstance(knowledge, list) and len(knowledge) == N_WAYS, \
-    f"knowledge should be list of {N_WAYS} strings, got {knowledge}"
+assert isinstance(knowledge, list) and len(knowledge) == BATCH_SIZE, \
+    f"knowledge should be list of {BATCH_SIZE} episode descriptions, got {type(knowledge)}"
+assert all(isinstance(ep, list) and len(ep) == N_WAYS for ep in knowledge), \
+    f"each episode's knowledge should be a list of {N_WAYS} strings"
 assert y_ctx.max().item() <= N_WAYS - 1,  "label out of range in context"
 assert y_qry.max().item() <= N_WAYS - 1,  "label out of range in query"
 
@@ -301,9 +303,8 @@ ok("Knowledge masked correctly at rate=1.0")
 
 trainer.knowledge_mask_rate = 0.0   # force never mask
 unmasked = trainer._maybe_mask_knowledge(knowledge)
-assert unmasked is not None, "Knowledge should not be None when mask_rate=0.0"
+assert len(unmasked) == BATCH_SIZE, "Unmasked knowledge should have bs entries"
 ok("Knowledge preserved correctly at rate=0.0")
-
 # ── Done ──────────────────────────────────────────────────────────────────────
 
 section("ALL CHECKS PASSED")

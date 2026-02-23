@@ -188,72 +188,58 @@ class ClassificationTrainer:
         """
         Evaluate with a specific number of shots per class.
 
-        For zero-shot (num_shots_per_class=0), context is empty.
-        We sub-sample context from the query set to simulate k-shot.
-
-        batch: (x_all, y_all, knowledge, task_ids)
-            where x_all contains ALL images for the task and
-            y_all contains ALL labels.
-
-        OR the same format as training:
-            (x_context, y_context, x_query, y_query, knowledge, task_ids)
-            In this case we rebuild context from query for controlled eval.
+        Sub-sample context from the CONTEXT portion of the batch,
+        not from query. Query images are always kept intact (num_query * N)
+        so accuracy is comparable across different k settings.
         """
-        # Unpack – support both formats
-        if len(batch) == 6:
-            _, _, x_all, y_all, knowledge, _ids = batch
-        else:
-            x_all, y_all, knowledge, _ids = batch
+        x_context, y_context, x_query, y_query, knowledge, _ids = batch
 
-        x_all = x_all.to(self.device)
-        y_all = y_all.to(self.device)
+        x_context = x_context.to(self.device)
+        y_context = y_context.to(self.device)
+        x_query   = x_query.to(self.device)
+        y_query   = y_query.to(self.device)
+
         if isinstance(knowledge, torch.Tensor):
             knowledge = knowledge.to(self.device)
 
-        bs = x_all.shape[0]
+        bs = x_context.shape[0]
         n_ways = self.config.n_ways
 
         if num_shots_per_class == 0:
-            # Zero-shot: empty context
-            x_context = torch.zeros(bs, 0, x_all.shape[-1], device=self.device)
-            y_context = torch.zeros(bs, 0, dtype=torch.long, device=self.device)
-            x_query = x_all
-            y_query = y_all
+            # Zero-shot: empty context (padded to length 1 for tensor shape)
+            x_ctx_eval = torch.zeros(bs, 1, x_context.shape[-1], device=self.device)
+            y_ctx_eval = torch.zeros(bs, 1, dtype=torch.long, device=self.device)
         else:
-            # Sub-sample `num_shots_per_class` per class for context
-            context_indices = []
-            query_indices = []
+            # Sub-sample from the context set: take up to num_shots_per_class
+            # per class from the already-provided context embeddings.
+            x_ctx_list, y_ctx_list = [], []
             for b in range(bs):
-                c_idx = []
-                q_idx = []
+                parts_x, parts_y = [], []
                 for c in range(n_ways):
-                    cls_mask = (y_all[b] == c).nonzero(as_tuple=True)[0]
-                    perm = cls_mask[torch.randperm(len(cls_mask))]
-                    k = min(num_shots_per_class, len(perm))
-                    c_idx.append(perm[:k])
-                    q_idx.append(perm[k:])
-                context_indices.append(torch.cat(c_idx))
-                query_indices.append(torch.cat(q_idx))
+                    cls_mask = (y_context[b] == c).nonzero(as_tuple=True)[0]
+                    # Filter out zero-padding (where x is all zeros)
+                    valid = cls_mask[x_context[b, cls_mask].abs().sum(-1) > 0]
+                    n_avail = len(valid)
+                    k = min(num_shots_per_class, n_avail)
+                    if k > 0:
+                        perm = valid[torch.randperm(n_avail, device=self.device)[:k]]
+                        parts_x.append(x_context[b, perm])
+                        parts_y.append(y_context[b, perm])
+                if parts_x:
+                    x_ctx_list.append(torch.cat(parts_x))
+                    y_ctx_list.append(torch.cat(parts_y))
+                else:
+                    x_ctx_list.append(torch.zeros(1, x_context.shape[-1], device=self.device))
+                    y_ctx_list.append(torch.zeros(1, dtype=torch.long, device=self.device))
 
             # Pad to uniform length across batch
-            max_ctx = max(len(ci) for ci in context_indices)
-            max_qry = max(len(qi) for qi in query_indices)
-
-            x_ctx_list, y_ctx_list = [], []
-            x_qry_list, y_qry_list = [], []
+            max_ctx = max(xc.shape[0] for xc in x_ctx_list)
+            x_ctx_eval = torch.zeros(bs, max_ctx, x_context.shape[-1], device=self.device)
+            y_ctx_eval = torch.zeros(bs, max_ctx, dtype=torch.long, device=self.device)
             for b in range(bs):
-                ci = context_indices[b]
-                qi = query_indices[b]
-                x_ctx_list.append(x_all[b, ci])
-                y_ctx_list.append(y_all[b, ci])
-                x_qry_list.append(x_all[b, qi])
-                y_qry_list.append(y_all[b, qi])
-
-            # Stack (all same size in episodic setting)
-            x_context = torch.stack(x_ctx_list)
-            y_context = torch.stack(y_ctx_list)
-            x_query = torch.stack(x_qry_list)
-            y_query = torch.stack(y_qry_list)
+                n = x_ctx_list[b].shape[0]
+                x_ctx_eval[b, :n] = x_ctx_list[b]
+                y_ctx_eval[b, :n] = y_ctx_list[b]
 
         # Don't mask knowledge at eval time
         if not self.use_knowledge:
@@ -261,7 +247,7 @@ class ClassificationTrainer:
 
         # Forward (model in eval mode → q_zCct = None)
         logits, z_samples, q_zCc, q_zCct = self.model(
-            x_context, y_context, x_query,
+            x_ctx_eval, y_ctx_eval, x_query,
             y_query=None, knowledge=knowledge,
         )
 

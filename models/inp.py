@@ -14,27 +14,44 @@ class CLIPTextKnowledgeEncoder(nn.Module):
         super().__init__()
         self.tokenizer = tokenizer
 
-        # Freeze CLIP parameters
         if freeze_clip:
             for param in clip_model.parameters():
                 param.requires_grad = False
 
-        # Store as a non-module reference so it doesn't appear in state_dict
-        # This keeps checkpoint size to just the projection layer (~1MB)
-        self._clip_ref = [clip_model]   # list wrapper prevents nn.Module registration
+        # List wrapper prevents nn.Module registration (keeps checkpoint small)
+        # but also hides it from .to() — we handle device manually in forward().
+        self._clip_ref = [clip_model]
 
         self.proj = nn.Linear(512, d)
 
+    def _encode_text_avg_pool(self, tokens: torch.Tensor, clip) -> torch.Tensor:
+        """
+        Paper (Appendix A.6.3, Setup C):
+          "The embeddings of class descriptions are obtained as the average
+           of all outputs from the last layer of CLIP."
+
+        Args:
+            tokens: [N, context_length] token ids
+            clip:   CLIP model (already on correct device)
+        Returns:
+            [N, 512]
+        """
+        x = clip.token_embedding(tokens)        # [N, seq_len, width]
+        x = x + clip.positional_embedding       # broadcast add
+        x = x.permute(1, 0, 2)                  # [seq_len, N, width]
+        x = clip.transformer(x)
+        x = x.permute(1, 0, 2)                  # [N, seq_len, width]
+        x = clip.ln_final(x)                    # [N, seq_len, 512]
+        return x.mean(dim=1)                     # [N, 512]
+
     def forward(self, descriptions):
         device = self.proj.weight.device
-        clip_model = self._clip_ref[0]
+        clip = self._clip_ref[0].to(device)      # ensure CLIP is on same device
         tokens = self.tokenizer(descriptions).to(device)
         with torch.no_grad():
-            text_embeds = clip_model.encode_text(tokens)   # [N, 512]
-        k = self.proj(text_embeds)   # [N, d]
+            text_embeds = self._encode_text_avg_pool(tokens, clip)  # [N, 512]
+        k = self.proj(text_embeds)  # [N, d]
         return k
-
-
 class INP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -210,18 +227,12 @@ class INP_MedClassification(nn.Module):
 
         Returns r : [bs, N, d]
 
-        Zero-shot note: when k=0, collate_episodic pads x to shape [bs, 1, d]
-        with zeros and y to all-zeros. The mask for class 0 fires on the padding
-        giving a zero mean (correct), and classes 1..N-1 get count=0 (clamped to
-        1) also giving zero vectors (correct). Downstream infer_latent_dist then
-        receives r=0 and relies on knowledge alone — the intended zero-shot behaviour.
         """
         bs = x.shape[0]
         r  = torch.zeros(bs, self.n_ways, self.d, device=x.device, dtype=x.dtype)
         for c in range(self.n_ways):
-            mask  = (y == c).unsqueeze(-1).float()   # [bs, M, 1]
-            count = mask.sum(dim=1).clamp(min=1)     # [bs, 1]
-            r[:, c, :] = (x * mask).sum(dim=1) / count
+            mask = (y == c).unsqueeze(-1).float()    # [bs, M, 1]
+            r[:, c, :] = (x * mask).sum(dim=1)      # [bs, d]
         return r
 
     def infer_latent_dist(
@@ -265,6 +276,7 @@ class INP_MedClassification(nn.Module):
         y_query:   torch.Tensor = None,
         knowledge: list         = None,
     ):
+        bs = x_context.shape[0]
         # ── 1. Project CLIP embeddings into hidden space ──────────────────────
         # This is the only trainable transformation on the image side.
         # Must be applied before any aggregation or decoding.
@@ -276,8 +288,9 @@ class INP_MedClassification(nn.Module):
 
         # ── 3. Knowledge embedding ────────────────────────────────────────────
         if knowledge is not None:
-            k = self.knowledge_encoder(knowledge)        # [N, d]
-            k = k.unsqueeze(0).expand(r_C.shape[0], -1, -1)  # [bs, N, d]
+            flat_descs = [desc for ep_descs in knowledge for desc in ep_descs]
+            flat_k = self.knowledge_encoder(flat_descs)    # [bs*N, d]
+            k = flat_k.view(bs, self.n_ways, self.d)       # [bs, N, d]
         else:
             k = torch.zeros_like(r_C)
 

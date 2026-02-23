@@ -471,7 +471,11 @@ def collate_episodic(batch):
     y_query = torch.stack(y_qry_list)   # [bs, num_query*N]
 
     # All episodes in a batch share the same split class pool and descriptions
-    knowledge_out = knowledges[0]
+    if any(k is None for k in knowledges):
+        knowledge_out = None
+    else:
+        knowledge_out = knowledges   # list[list[str]], shape [bs][N]
+
 
     return (
         x_context_padded,
