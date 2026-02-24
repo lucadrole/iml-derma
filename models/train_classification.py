@@ -133,6 +133,7 @@ class ClassificationTrainer:
             return None
         if self.training_phase and np.random.rand() < self.knowledge_mask_rate:
             return None
+        
         return knowledge
 
     # ------------------------------------------------------------------
@@ -208,7 +209,7 @@ class ClassificationTrainer:
         if num_shots_per_class == 0:
             # Zero-shot: empty context (padded to length 1 for tensor shape)
             x_ctx_eval = torch.zeros(bs, 1, x_context.shape[-1], device=self.device)
-            y_ctx_eval = torch.zeros(bs, 1, dtype=torch.long, device=self.device)
+            y_ctx_eval = torch.full((bs, 1), self.config.n_ways, dtype=torch.long, device=self.device)
         else:
             # Sub-sample from the context set: take up to num_shots_per_class
             # per class from the already-provided context embeddings.

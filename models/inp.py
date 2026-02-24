@@ -231,9 +231,17 @@ class INP_MedClassification(nn.Module):
         bs = x.shape[0]
         r  = torch.zeros(bs, self.n_ways, self.d, device=x.device, dtype=x.dtype)
         for c in range(self.n_ways):
-            mask = (y == c).unsqueeze(-1).float()    # [bs, M, 1]
-            r[:, c, :] = (x * mask).sum(dim=1)      # [bs, d]
+            mask = (y == c).unsqueeze(-1).float()
+            r[:, c, :] = (x * mask).sum(dim=1)      # sum, matching paper
+        
+        # for c in range(self.n_ways):
+        #     mask = (y == c).unsqueeze(-1).float()
+        #     count = mask.sum(dim=1).clamp(min=1)    # [bs, 1]
+        #     r[:, c, :] = (x * mask).sum(dim=1) / count   # mean
+
+
         return r
+
 
     def infer_latent_dist(
         self, r: torch.Tensor, k: torch.Tensor
