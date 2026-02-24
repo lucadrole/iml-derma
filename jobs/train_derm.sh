@@ -54,7 +54,7 @@ mkdir -p out
 # python dataset/dermnet.py --data-root data/dermnet --encoder biomedclip --biomedclip-dir data/biomedclip
 conda activate inps
 # --- Option B: Train with mixed ISIC + DermNet (BiomedCLIP) ---
-python models/train_classification.py --config /home/ldrole/my_space/work/cam_phd/informed-meta-learning/config_isic_biomedclip.toml
+python models/train_classification.py --config /home/ldrole/my_space/work/cam_phd/informed-meta-learning/config_again/config_isic_dermnet_biomedclip.toml
 
 # --- Option C: Train ISIC-only baseline (for comparison) ---
 # python train_classification.py --config config_isic.toml

@@ -73,26 +73,31 @@ ALL_CLASSES = list(CLASS_CODES.keys())   # 8 entries
 # CSV column order for the 8 labelled classes (UNK handled separately)
 GT_COLUMNS = ["MEL", "NV", "BCC", "AK", "BKL", "DF", "VASC", "SCC"]
 
-MODALITY = 1
-# Meta-learning split assignment
-if MODALITY == 0:
-    SPLIT_CLASSES = {
-        "train": ["Melanoma", "Melanocytic Nevus", "Basal Cell Carcinoma", "Actinic Keratosis"],
-        "val":   ["Benign Keratosis", "Dermatofibroma"],
-        "test":  ["Vascular Lesion", "Squamous Cell Carcinoma"],
-    }
-elif MODALITY == 1:
-     SPLIT_CLASSES = {
-        "train": ["Melanoma", "Melanocytic Nevus", "Basal Cell Carcinoma", "Actinic Keratosis"],
-        "val":   ["Vascular Lesion", "Squamous Cell Carcinoma"],
-        "test":  ["Benign Keratosis", "Dermatofibroma"],
-    }
+# MODALITY = 1
+# # Meta-learning split assignment
+# if MODALITY == 0:
+#     SPLIT_CLASSES = {
+#         "train": ["Melanoma", "Melanocytic Nevus", "Basal Cell Carcinoma", "Actinic Keratosis"],
+#         "val":   ["Benign Keratosis", "Dermatofibroma"],
+#         "test":  ["Vascular Lesion", "Squamous Cell Carcinoma"],
+#     }
+# elif MODALITY == 1:
+#      SPLIT_CLASSES = {
+#         "train": ["Melanoma", "Melanocytic Nevus", "Basal Cell Carcinoma", "Actinic Keratosis"],
+#         "val":   ["Vascular Lesion", "Squamous Cell Carcinoma"],
+#         "test":  ["Benign Keratosis", "Dermatofibroma"],
+#     }
      
-SPLIT_CLASSES_ORIGINAL = {
+# SPLIT_CLASSES_ORIGINAL = {
+#     "train": ["Melanoma", "Melanocytic Nevus", "Basal Cell Carcinoma", "Actinic Keratosis"],
+#     "val":   ["Benign Keratosis", "Dermatofibroma"],
+#     "test":  ["Vascular Lesion", "Squamous Cell Carcinoma"],
+#     "test":  ["Benign Keratosis", "Dermatofibroma"],
+# }
+SPLIT_CLASSES = {
     "train": ["Melanoma", "Melanocytic Nevus", "Basal Cell Carcinoma", "Actinic Keratosis"],
     "val":   ["Benign Keratosis", "Dermatofibroma"],
     "test":  ["Vascular Lesion", "Squamous Cell Carcinoma"],
-    "test":  ["Benign Keratosis", "Dermatofibroma"],
 }
 
 # Kaggle download nests images one extra level deep

@@ -5,3 +5,7 @@ figures/*
 data/
 out/
 test_resuts_base.json
+test_resuts_base2.json
+test_results_bio.json
+test_results.json
+finalsed_models.txt

@@ -1,0 +1,71 @@
+{
+  "inp_checkpoint": "/home/ldrole/my_space/work/cam_phd/informed-meta-learning/saves/INPs_isic/inp_9/model_best.pt",
+  "np_checkpoint": "/home/ldrole/my_space/work/cam_phd/informed-meta-learning/saves/INPs_isic/in_8/model_best.pt",
+  "n_tasks": 500,
+  "n_ways": 2,
+  "test_classes": [
+    "Vascular Lesion",
+    "Squamous Cell Carcinoma"
+  ],
+  "shot_settings": [
+    0,
+    1,
+    3,
+    5,
+    10
+  ],
+  "INP": {
+    "0": {
+      "mean": 24.180000531673432,
+      "stderr": 0.26687695088407487,
+      "n_tasks": 500
+    },
+    "1": {
+      "mean": 23.955000507086517,
+      "stderr": 0.26885008058069343,
+      "n_tasks": 500
+    },
+    "3": {
+      "mean": 23.985000464320184,
+      "stderr": 0.26973190697027993,
+      "n_tasks": 500
+    },
+    "5": {
+      "mean": 24.260000524669888,
+      "stderr": 0.2709221622574781,
+      "n_tasks": 500
+    },
+    "10": {
+      "mean": 25.650000558793547,
+      "stderr": 0.28969387329955243,
+      "n_tasks": 500
+    }
+  },
+  "NP": {
+    "0": {
+      "mean": 52.05500070601702,
+      "stderr": 1.174709585327781,
+      "n_tasks": 500
+    },
+    "1": {
+      "mean": 76.40500131100416,
+      "stderr": 0.7248063070809736,
+      "n_tasks": 500
+    },
+    "3": {
+      "mean": 81.61500114798545,
+      "stderr": 0.37861320338630133,
+      "n_tasks": 500
+    },
+    "5": {
+      "mean": 82.97000110149384,
+      "stderr": 0.34552009533841366,
+      "n_tasks": 500
+    },
+    "10": {
+      "mean": 84.84000123739243,
+      "stderr": 0.2723253757514539,
+      "n_tasks": 500
+    }
+  }
+}

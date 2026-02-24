@@ -1,0 +1,60 @@
+# INP Medical Image Classification — ISIC 2019 + DermNet mixed training
+# Extends config_isic.toml with DermNet auxiliary data for task diversity.
+#
+# To run:
+#   1. Build DermNet embeddings:
+#        python dataset/dermnet.py --data-root data/dermnet --encoder clip
+#   2. Train:
+#        python train_classification.py --config config_isic_dermnet.toml
+
+project_name = "INPs_isic_dermnet"
+seed = 42
+load_it = "best"
+
+# ── Training ──────────────────────────────────────────────────────────────────
+batch_size = 32
+num_epochs = 100
+lr = 1e-4
+decay_lr = 10
+beta = 1.0
+n_trials = 1
+
+# ── Dataset — ISIC (primary) ─────────────────────────────────────────────────
+dataset = "isic_dermnet"              # signals mixed training
+data_root = "data/isic2019"
+encoder_type = "clip"
+biomedclip_dir = ""
+
+# ── Dataset — DermNet (auxiliary) ─────────────────────────────────────────────
+dermnet_data_root = "data/dermnet"
+dermnet_ratio = 0.5                   # probability of sampling DermNet episode
+                                      # 0.5 = half ISIC, half DermNet
+                                      # try 0.3-0.7 to tune
+
+# ── Episodes ──────────────────────────────────────────────────────────────────
+n_episodes_train = 10000
+n_episodes_val = 1000
+num_workers = 0
+
+# ── Task construction ─────────────────────────────────────────────────────────
+n_ways = 2                            # must be ≤ min(ISIC train classes, DermNet classes)
+                                      # ISIC has 4, DermNet has 19 → can go up to 4
+min_num_context = 0
+max_num_context = 10
+num_targets = 20
+
+# ── Knowledge ─────────────────────────────────────────────────────────────────
+use_knowledge = true
+knowledge_setup = "C"
+knowledge_mask_rate = 0.5             # paper default; was 1.0 in your ISIC-only config
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+clip_dim = 512
+hidden_dim = 512
+train_num_z_samples = 1
+test_num_z_samples = 16
+
+# ── Saving / loading ──────────────────────────────────────────────────────────
+run_name_prefix = "inp_mixed"
+run_name_suffix = "_nok"
+load_path = "/home/ldrole/my_space/work/cam_phd/informed-meta-learning/saves/INPs_isic_dermnet/inp_mixed_6/model_best.pt"                        # set to NP checkpoint path for stage 2

@@ -1,0 +1,13 @@
+STAGE 1
+---------------------
+BASE: /home/ldrole/my_space/work/cam_phd/informed-meta-learning/saves/INPs_isic/in_8/model_best.pt
+BASE_BIOCLIP: /home/ldrole/my_space/work/cam_phd/informed-meta-learning/saves/INPs_isic/inp_20/model_best.pt
+DOULE_DATA: /home/ldrole/my_space/work/cam_phd/informed-meta-learning/saves/INPs_isic_dermnet/inp_mixed_6/model_best.pt
+DOUBLE_DATA_BIOCLIP: /home/ldrole/my_space/work/cam_phd/informed-meta-learning/saves/INPs_isic_dermnet/inp_mixed_8/model_best.pt
+
+
+
+STAGE 2:
+BASE: "/home/ldrole/my_space/work/cam_phd/informed-meta-learning/saves/INPs_isic/inp_9/model_best.pt",
+BASE_BIOCLIP: "/home/ldrole/my_space/work/cam_phd/informed-meta-learning/saves/INPs_isic/inp_21/model_best.pt",
+DOULE_DATA:/home/ldrole/my_space/work/cam_phd/informed-meta-learning/saves/INPs_isic_dermnet/inp_mixed_10/model_best.pt

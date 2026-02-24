@@ -1,0 +1,48 @@
+# INP Medical Image Classification — ISIC 2019
+# Stage 1: plain NP (no knowledge)
+# To run stage 2 (INP), set use_knowledge=true and load_path to stage 1 checkpoint
+
+project_name = "INPs_isic"
+seed = 42
+load_it = "best"
+
+# ── Training ──────────────────────────────────────────────────────────────────
+batch_size = 32
+num_epochs = 100                  # each epoch = one pass over n_episodes_train tasks
+lr = 1e-4                        # per paper Setup C
+decay_lr = 10
+beta = 1.0                       # ELBO beta weight
+n_trials = 1
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset = "isic"
+data_root = "data/isic2019"
+encoder_type = "biomedclip"
+biomedclip_dir = "data/biomedclip"
+
+n_episodes_train = 5000
+n_episodes_val = 1000
+num_workers = 0
+
+# ── Task construction ─────────────────────────────────────────────────────────
+n_ways = 2                       # fixed at 2 (val/test only have 2 classes)
+min_num_context = 0              # k_min shots per class
+max_num_context = 10             # k_max shots per class  (paper: U[0,10])
+num_targets = 20                 # query images per class (paper: 20)
+
+# ── Knowledge ─────────────────────────────────────────────────────────────────
+use_knowledge = true            # stage 1: no knowledge; stage 2: true
+knowledge_setup = "C"            # only C implemented
+knowledge_mask_rate = 0.5        # masking rate during training (paper: 0.5)
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+clip_dim = 512                   # CLIP ViT-B/32 output dim (also BiomedCLIP)
+hidden_dim = 512                 # latent dim d
+train_num_z_samples = 1
+test_num_z_samples = 16
+
+# ── Saving / loading ──────────────────────────────────────────────────────────
+run_name_prefix = "inp"           # stage 1: "np", stage 2: "inp"
+run_name_suffix = ""
+load_path = ""                   # set to stage 1 checkpoint path for stage 2
+#load_path = "/home/ldrole/my_space/work/cam_phd/informed-meta-learning/saves/INPs_isic/inp_20/model_best.pt"
