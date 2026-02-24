@@ -10,9 +10,24 @@ from models.modules import XYEncoder, LatentEncoder, Decoder, XEncoder
 from models.utils import MultivariateNormalDiag
 
 class CLIPTextKnowledgeEncoder(nn.Module):
-    def __init__(self, clip_model, tokenizer, d, freeze_clip=True):
+    """
+    Frozen text encoder + trainable linear projection.
+
+    Supports two backends via encoder_type:
+      - "clip":       OpenAI CLIP ViT-B/32 text tower (77-token, custom transformer)
+      - "biomedclip": BiomedCLIP PubMedBERT text tower (256-token, HF BERT-based)
+
+    Both use average pooling over last-layer hidden states, matching the paper
+    (Appendix A.6.3, Setup C):
+      "The embeddings of class descriptions are obtained as the average
+       of all outputs from the last layer of CLIP."
+    """
+
+    def __init__(self, clip_model, tokenizer, d, encoder_type="clip",
+                 freeze_clip=True, embed_dim=512):
         super().__init__()
         self.tokenizer = tokenizer
+        self.encoder_type = encoder_type
 
         if freeze_clip:
             for param in clip_model.parameters():
@@ -22,20 +37,10 @@ class CLIPTextKnowledgeEncoder(nn.Module):
         # but also hides it from .to() — we handle device manually in forward().
         self._clip_ref = [clip_model]
 
-        self.proj = nn.Linear(512, d)
+        self.proj = nn.Linear(embed_dim, d)
 
-    def _encode_text_avg_pool(self, tokens: torch.Tensor, clip) -> torch.Tensor:
-        """
-        Paper (Appendix A.6.3, Setup C):
-          "The embeddings of class descriptions are obtained as the average
-           of all outputs from the last layer of CLIP."
-
-        Args:
-            tokens: [N, context_length] token ids
-            clip:   CLIP model (already on correct device)
-        Returns:
-            [N, 512]
-        """
+    def _encode_text_avg_pool_clip(self, tokens, clip):
+        """Average-pool all token outputs from CLIP's custom transformer."""
         x = clip.token_embedding(tokens)        # [N, seq_len, width]
         x = x + clip.positional_embedding       # broadcast add
         x = x.permute(1, 0, 2)                  # [seq_len, N, width]
@@ -44,12 +49,54 @@ class CLIPTextKnowledgeEncoder(nn.Module):
         x = clip.ln_final(x)                    # [N, seq_len, 512]
         return x.mean(dim=1)                     # [N, 512]
 
+    def _encode_text_avg_pool_biomedclip(self, tokens, clip):
+        """
+        Average-pool last-layer hidden states from BiomedCLIP's PubMedBERT.
+
+        open_clip wraps BiomedCLIP's text encoder in an HFTextEncoder.
+        The underlying HF BERT model is at clip.text.transformer.
+        We run it directly to get the full hidden state for avg pooling.
+        """
+        text_encoder = clip.text  # open_clip HFTextEncoder wrapper
+
+        # Attention mask: 1 for real tokens, 0 for padding
+        attn_mask = (tokens != 0).long()
+
+        # Forward through the HF BERT model
+        outputs = text_encoder.transformer(
+            input_ids=tokens,
+            attention_mask=attn_mask,
+        )
+        last_hidden = outputs.last_hidden_state  # [N, seq_len, 768]
+
+        # Average pool over non-padding positions
+        mask = attn_mask.unsqueeze(-1).float()   # [N, seq_len, 1]
+        pooled = (last_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        # pooled: [N, 768]
+
+        # Apply text projection (768 -> 512) if present
+        # In BiomedCLIP, text_encoder.proj can be nn.Sequential or nn.Parameter
+        if hasattr(text_encoder, 'proj') and text_encoder.proj is not None:
+            if isinstance(text_encoder.proj, nn.Module):
+                pooled = text_encoder.proj(pooled)   # nn.Sequential or nn.Linear
+            else:
+                pooled = pooled @ text_encoder.proj   # raw weight matrix
+
+        return pooled
+
     def forward(self, descriptions):
         device = self.proj.weight.device
-        clip = self._clip_ref[0].to(device)      # ensure CLIP is on same device
-        tokens = self.tokenizer(descriptions).to(device)
-        with torch.no_grad():
-            text_embeds = self._encode_text_avg_pool(tokens, clip)  # [N, 512]
+        clip = self._clip_ref[0].to(device)
+
+        if self.encoder_type == "biomedclip":
+            tokens = self.tokenizer(descriptions, context_length=256).to(device)
+            with torch.no_grad():
+                text_embeds = self._encode_text_avg_pool_biomedclip(tokens, clip)
+        else:
+            tokens = self.tokenizer(descriptions).to(device)
+            with torch.no_grad():
+                text_embeds = self._encode_text_avg_pool_clip(tokens, clip)
+
         k = self.proj(text_embeds)  # [N, d]
         return k
 class INP(nn.Module):
@@ -190,9 +237,12 @@ class INP_MedClassification(nn.Module):
         self.image_proj = nn.Linear(config.clip_dim, self.d)
 
         # ── Knowledge encoder (Setup C) ───────────────────────────────────────
-        # Frozen CLIP text encoder + trainable linear projection.
+        # Frozen CLIP/BiomedCLIP text encoder + trainable linear projection.
+        encoder_type = getattr(config, "encoder_type", "clip")
         self.knowledge_encoder = CLIPTextKnowledgeEncoder(
-            clip_model, tokenizer, self.d
+            clip_model, tokenizer, self.d,
+            encoder_type=encoder_type,
+            embed_dim=config.clip_dim,
         )
 
         # ── Aggregator: (r + k) -> (mu_z, sigma_z) ───────────────────────────
@@ -233,15 +283,7 @@ class INP_MedClassification(nn.Module):
         for c in range(self.n_ways):
             mask = (y == c).unsqueeze(-1).float()
             r[:, c, :] = (x * mask).sum(dim=1)      # sum, matching paper
-        
-        # for c in range(self.n_ways):
-        #     mask = (y == c).unsqueeze(-1).float()
-        #     count = mask.sum(dim=1).clamp(min=1)    # [bs, 1]
-        #     r[:, c, :] = (x * mask).sum(dim=1) / count   # mean
-
-
         return r
-
 
     def infer_latent_dist(
         self, r: torch.Tensor, k: torch.Tensor
@@ -325,6 +367,4 @@ class INP_MedClassification(nn.Module):
         logits = self.decode(x_query, z_samples)        # [n_z, bs, Q*N, N]
 
         return logits, z_samples, q_zCc, q_zCct
-
-
 

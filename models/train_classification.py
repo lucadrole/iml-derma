@@ -453,6 +453,7 @@ if __name__ == "__main__":
     import argparse
     from config import Config
     from dataset.isic import setup_isic_dataloaders
+    from dataset.mixed_episodic import setup_mixed_dataloaders
     import open_clip
 
     parser = argparse.ArgumentParser()
@@ -462,19 +463,88 @@ if __name__ == "__main__":
 
     config = Config.from_toml(args.config)
 
-    # Load CLIP model
+    # ── Load vision-language model (CLIP or BiomedCLIP) ───────────────────
     device = get_device()
-    clip_model, _, _ = open_clip.create_model_and_transforms(
-        "ViT-B-32", pretrained="openai"
-    )
+    encoder_type = getattr(config, "encoder_type", "clip")
+
+    if encoder_type == "biomedclip":
+        import json
+        biomedclip_dir = getattr(config, "biomedclip_dir", None)
+
+        if biomedclip_dir and os.path.isdir(biomedclip_dir):
+            # Load from local directory
+            from open_clip.factory import HF_HUB_PREFIX, _MODEL_CONFIGS
+
+            with open(os.path.join(biomedclip_dir, "open_clip_config.json")) as f:
+                clip_cfg = json.load(f)
+
+            model_name = "biomedclip_local"
+            if model_name not in _MODEL_CONFIGS:
+                _MODEL_CONFIGS[model_name] = clip_cfg["model_cfg"]
+
+            preprocess_cfg = clip_cfg["preprocess_cfg"]
+            clip_model, _, _ = open_clip.create_model_and_transforms(
+                model_name=model_name,
+                pretrained=os.path.join(biomedclip_dir, "open_clip_pytorch_model.bin"),
+                **{f"image_{k}": v for k, v in preprocess_cfg.items()},
+            )
+            tokenizer = open_clip.get_tokenizer(model_name)
+        else:
+            # Load from HuggingFace Hub
+            from open_clip import create_model_from_pretrained, get_tokenizer
+            hf_name = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
+            clip_model, _ = create_model_from_pretrained(hf_name)
+            tokenizer = get_tokenizer(hf_name)
+
+        print(f"Loaded BiomedCLIP (PubMedBERT + ViT-B/16)")
+    else:
+        clip_model, _, _ = open_clip.create_model_and_transforms(
+            "ViT-B-32", pretrained="openai"
+        )
+        tokenizer = open_clip.get_tokenizer("ViT-B-32")
+        print(f"Loaded CLIP ViT-B/32")
+
     clip_model = clip_model.to(device)
-    tokenizer = open_clip.get_tokenizer("ViT-B-32")
+
+    # ── Choose dataloader ─────────────────────────────────────────────────
+    dataset = getattr(config, "dataset", "isic")
+    if dataset == "isic_dermnet":
+        setup_fn = setup_mixed_dataloaders
+    else:
+        setup_fn = setup_isic_dataloaders
 
     meta_train(
         trial=None,
         config=config,
         clip_model=clip_model,
         tokenizer=tokenizer,
-        setup_dataloaders_fn=setup_isic_dataloaders,
+        setup_dataloaders_fn=setup_fn,
         run_name_prefix=getattr(config, "run_name_prefix", "run"),
     )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

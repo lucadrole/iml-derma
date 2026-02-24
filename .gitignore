@@ -3,3 +3,5 @@ saves/**
 wandb/**
 figures/*
 data/
+out/
+test_resuts_base.json
