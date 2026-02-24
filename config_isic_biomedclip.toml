@@ -7,7 +7,7 @@ seed = 42
 load_it = "best"
 
 # ── Training ──────────────────────────────────────────────────────────────────
-batch_size = 64
+batch_size = 32
 num_epochs = 100                  # each epoch = one pass over n_episodes_train tasks
 lr = 1e-4                        # per paper Setup C
 decay_lr = 10
@@ -45,4 +45,4 @@ test_num_z_samples = 16
 run_name_prefix = "inp"           # stage 1: "np", stage 2: "inp"
 run_name_suffix = ""
 load_path = ""                   # set to stage 1 checkpoint path for stage 2
-#load_path = "/home/ldrole/my_space/work/cam_phd/informed-meta-learning/saves/INPs_isic/in_8/model_best.pt"
+#load_path = ""

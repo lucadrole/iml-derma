@@ -44,7 +44,7 @@ max_num_context = 10
 num_targets = 20
 
 # ── Knowledge ─────────────────────────────────────────────────────────────────
-use_knowledge = false
+use_knowledge = true
 knowledge_setup = "C"
 knowledge_mask_rate = 0.5             # paper default; was 1.0 in your ISIC-only config
 
@@ -57,4 +57,4 @@ test_num_z_samples = 16
 # ── Saving / loading ──────────────────────────────────────────────────────────
 run_name_prefix = "inp_mixed"
 run_name_suffix = "_nok"
-load_path = ""                        # set to NP checkpoint path for stage 2
+load_path = "/home/ldrole/my_space/work/cam_phd/informed-meta-learning/saves/INPs_isic_dermnet/inp_mixed_3/model_best.pt"                        # set to NP checkpoint path for stage 2

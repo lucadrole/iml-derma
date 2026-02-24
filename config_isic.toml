@@ -31,9 +31,9 @@ max_num_context = 10             # k_max shots per class  (paper: U[0,10])
 num_targets = 20                 # query images per class (paper: 20)
 
 # ── Knowledge ─────────────────────────────────────────────────────────────────
-use_knowledge = true            # stage 1: no knowledge; stage 2: true
+use_knowledge = false            # stage 1: no knowledge; stage 2: true
 knowledge_setup = "C"            # only C implemented
-knowledge_mask_rate = 0.3        # masking rate during training (paper: 0.5)
+knowledge_mask_rate = 0.5        # masking rate during training (paper: 0.5)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 clip_dim = 512                   # CLIP ViT-B/32 output dim (also BiomedCLIP)

@@ -5,15 +5,30 @@ Replicates the paper's Table 1 protocol (Section 5.2.2):
   - Shot settings: k = 0, 1, 3, 5, 10
   - 500 test tasks with bootstrap standard errors
   - Reports accuracy (%) for each shot setting
-  - Compares INP (with knowledge) vs NP (knowledge masked) in a single run
+  - Compares two SEPARATE models:
+      NP  = stage-1 checkpoint (trained without knowledge)
+      INP = stage-2 checkpoint (fine-tuned with knowledge)
 
 Usage
 -----
-python evaluate_test.py \\
-    --checkpoint saves/isic/run_0/model_best.pt \\
-    --config     config_isic.toml \\
-    --n-tasks    500 \\
-    --n-bootstrap 1000
+# Evaluate INP only:
+python evaluate_test.py \
+    --inp-checkpoint saves/isic/inp_0/model_best.pt \
+    --config config_isic.toml
+
+
+# Compare NP vs INP (paper Table 1 style):
+python evaluate_test.py \
+    --inp-checkpoint saves/isic/inp_0/model_best.pt \
+    --np-checkpoint  saves/isic/np_0/model_best.pt \
+    --config /home/ldrole/my_space/work/cam_phd/informed-meta-learning/config_isic.toml
+    
+# Compare NP vs INP (paper Table 1 style):
+python evaluate_test.py \
+    --inp-checkpoint /home/ldrole/my_space/work/cam_phd/informed-meta-learning/saves/INPs_isic/inp_9/model_best.pt \
+    --np-checkpoint  /home/ldrole/my_space/work/cam_phd/informed-meta-learning/saves/INPs_isic/in_8/model_best.pt \
+    --config config_isic.toml
+
 
 Outputs a table like Table 1 from the paper, plus saves results to a JSON file.
 """
@@ -32,7 +47,6 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.inp import INP_MedClassification
-from models.loss import ELBOLoss
 from dataset.isic import ISICEpisodicDataset, collate_episodic, SPLIT_CLASSES
 
 
@@ -52,6 +66,79 @@ def get_device():
     return torch.device("cpu")
 
 
+def load_model(config, clip_model, tokenizer, checkpoint_path, device):
+    """Instantiate an INP_MedClassification and load weights."""
+    model = INP_MedClassification(config, clip_model, tokenizer)
+    state_dict = torch.load(checkpoint_path, map_location=device)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"  Missing keys: {sorted(missing)}")
+    if unexpected:
+        print(f"  Unexpected keys: {sorted(unexpected)}")
+    model.to(device)
+    model.eval()
+    return model
+
+
+# ── Build context for a specific shot count ────────────────────────────────────
+
+def build_context_for_k(
+    x_context, y_context, ctx_mask, k_shot, n_ways, device,
+):
+    """
+    Sub-sample exactly k_shot per class from the provided context,
+    respecting the padding mask.
+
+    Returns (x_ctx_eval, y_ctx_eval, mask_eval) — all on `device`.
+    """
+    bs = x_context.shape[0]
+    d = x_context.shape[-1]
+
+    if k_shot == 0:
+        # Zero-shot: empty context with sentinel label and mask=False
+        x_ctx_eval = torch.zeros(bs, 1, d, device=device)
+        y_ctx_eval = torch.full((bs, 1), -1, dtype=torch.long, device=device)
+        mask_eval = torch.zeros(bs, 1, dtype=torch.bool, device=device)
+        return x_ctx_eval, y_ctx_eval, mask_eval
+
+    x_ctx_list, y_ctx_list = [], []
+    for b in range(bs):
+        parts_x, parts_y = [], []
+        for c in range(n_ways):
+            # Only consider real (non-padded) positions
+            cls_match = (y_context[b] == c) & ctx_mask[b]
+            valid = cls_match.nonzero(as_tuple=True)[0]
+            n_avail = len(valid)
+            k = min(k_shot, n_avail)
+            if k > 0:
+                perm = valid[torch.randperm(n_avail, device=device)[:k]]
+                parts_x.append(x_context[b, perm])
+                parts_y.append(y_context[b, perm])
+        if parts_x:
+            x_ctx_list.append(torch.cat(parts_x))
+            y_ctx_list.append(torch.cat(parts_y))
+        else:
+            # No valid context — use sentinel
+            x_ctx_list.append(torch.zeros(1, d, device=device))
+            y_ctx_list.append(torch.full((1,), -1, dtype=torch.long, device=device))
+
+    # Pad to uniform length across batch
+    max_ctx = max(xc.shape[0] for xc in x_ctx_list)
+    x_ctx_eval = torch.zeros(bs, max_ctx, d, device=device)
+    y_ctx_eval = torch.full((bs, max_ctx), -1, dtype=torch.long, device=device)
+    mask_eval = torch.zeros(bs, max_ctx, dtype=torch.bool, device=device)
+
+    for b in range(bs):
+        n = x_ctx_list[b].shape[0]
+        x_ctx_eval[b, :n] = x_ctx_list[b]
+        y_ctx_eval[b, :n] = y_ctx_list[b]
+        # Only mark as real if not the sentinel for empty episodes
+        if y_ctx_list[b][0].item() != -1:
+            mask_eval[b, :n] = True
+
+    return x_ctx_eval, y_ctx_eval, mask_eval
+
+
 # ── Core evaluation ────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -67,80 +154,49 @@ def evaluate_checkpoint(
     """
     Run evaluation at every shot setting over all batches in `dataloader`.
 
+    Parameters
+    ----------
+    model          : the model to evaluate
+    use_knowledge  : if True, pass knowledge to model; if False, pass None
+                     (use False for the NP baseline model)
+
     Returns
     -------
-    dict mapping shot -> {"mean": float, "stderr": float}
+    dict mapping shot -> {"mean": float, "stderr": float, "n_tasks": int}
     """
     model.eval()
-
-    # Accumulate per-episode accuracies for each shot setting
     per_shot_accs = defaultdict(list)
 
-    loss_func = ELBOLoss(beta=1.0, categorical=True)
-    loss_func.eval()
-
     for batch in dataloader:
-        x_context, y_context, x_query, y_query, knowledge, _ids = batch
+        x_context, y_context, x_query, y_query, knowledge, _ids, ctx_mask = batch
 
         x_context = x_context.to(device)
         y_context = y_context.to(device)
-        x_query   = x_query.to(device)
-        y_query   = y_query.to(device)
+        x_query = x_query.to(device)
+        y_query = y_query.to(device)
+        ctx_mask = ctx_mask.to(device)
 
         if isinstance(knowledge, torch.Tensor):
             knowledge = knowledge.to(device)
 
         bs = x_context.shape[0]
+        k_in = knowledge if use_knowledge else None
 
         for k_shot in shot_settings:
-            # Build the exact context for this shot count
-            if k_shot == 0:
-                x_ctx_eval = torch.zeros(bs, 1, x_context.shape[-1], device=device)
-                y_ctx_eval = torch.full(
-                    (bs, 1), n_ways, dtype=torch.long, device=device
-                )
-            else:
-                x_ctx_list, y_ctx_list = [], []
-                for b in range(bs):
-                    parts_x, parts_y = [], []
-                    for c in range(n_ways):
-                        cls_mask = (y_context[b] == c).nonzero(as_tuple=True)[0]
-                        take = cls_mask[: min(k_shot, len(cls_mask))]
-                        if len(take) > 0:
-                            parts_x.append(x_context[b][take])
-                            parts_y.append(y_context[b][take])
-                    if parts_x:
-                        x_ctx_list.append(torch.cat(parts_x, dim=0))
-                        y_ctx_list.append(torch.cat(parts_y, dim=0))
-                    else:
-                        x_ctx_list.append(torch.zeros(1, x_context.shape[-1], device=device))
-                        y_ctx_list.append(torch.full((1,), n_ways, dtype=torch.long, device=device))
-
-                # Pad to same length
-                max_len = max(x.shape[0] for x in x_ctx_list)
-                d = x_context.shape[-1]
-                x_ctx_eval = torch.zeros(bs, max_len, d, device=device)
-                y_ctx_eval = torch.zeros(bs, max_len, dtype=torch.long, device=device)
-                for b, (xc, yc) in enumerate(zip(x_ctx_list, y_ctx_list)):
-                    x_ctx_eval[b, :xc.shape[0]] = xc
-                    y_ctx_eval[b, :yc.shape[0]] = yc
-
-            # Optionally mask knowledge (for NP baseline comparison)
-            k_in = knowledge if use_knowledge else None
+            x_ctx_eval, y_ctx_eval, mask_eval = build_context_for_k(
+                x_context, y_context, ctx_mask, k_shot, n_ways, device,
+            )
 
             logits, z_samples, q_zCc, _ = model(
                 x_ctx_eval, y_ctx_eval, x_query,
                 y_query=None, knowledge=k_in,
+                ctx_mask=mask_eval,
             )
-            # print("logits shape:", logits.shape)        # expect [n_z, bs, Q*N, 2]
-            # print("logits sample:", logits[0, 0, :5])   # are all values the same?
-            # print("knowledge:", knowledge[:2] if knowledge else None)  # are descriptions loading?
-            # exit(0)
 
             # Accuracy: mean over z-samples
             mean_logits = logits.mean(dim=0)           # [bs, Q*N, N]
-            preds       = mean_logits.argmax(dim=-1)   # [bs, Q*N]
-            acc_per_ep  = (preds == y_query).float().mean(dim=-1)  # [bs]
+            preds = mean_logits.argmax(dim=-1)         # [bs, Q*N]
+            acc_per_ep = (preds == y_query).float().mean(dim=-1)  # [bs]
 
             per_shot_accs[k_shot].extend(acc_per_ep.cpu().tolist())
 
@@ -155,29 +211,65 @@ def evaluate_checkpoint(
     return results
 
 
+# ── Pretty-print table ─────────────────────────────────────────────────────────
+
+def print_table(shot_settings, inp_results, np_results=None, n_tasks=500, n_ways=2):
+    print("\n")
+    print("=" * 60)
+    print(f"  Final Test Results  ({n_tasks} tasks, {n_ways}-way)")
+    print("=" * 60)
+
+    if np_results is not None:
+        header = f"{'k':>4}  {'NP (%)':>14}  {'INP (%)':>14}  {'Δ':>8}"
+    else:
+        header = f"{'k':>4}  {'INP (%)':>14}"
+    print(header)
+    print("-" * len(header))
+
+    for k in shot_settings:
+        inp_m = inp_results[k]["mean"]
+        inp_se = inp_results[k]["stderr"]
+        if np_results is not None:
+            np_m = np_results[k]["mean"]
+            np_se = np_results[k]["stderr"]
+            delta = inp_m - np_m
+            print(
+                f"{k:>4}  {np_m:>8.1f} ({np_se:.1f})  "
+                f"{inp_m:>8.1f} ({inp_se:.1f})  {delta:>+7.1f}"
+            )
+        else:
+            print(f"{k:>4}  {inp_m:>8.1f} ({inp_se:.1f})")
+
+    print("=" * 60)
+    print("Format: mean (bootstrap stderr), both in %")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
         description="Final test-set evaluation matching paper Table 1 protocol."
     )
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to model_best.pt (or any .pt checkpoint)")
-    parser.add_argument("--config",     type=str, required=True,
-                        help="Path to config TOML used during training")
-    parser.add_argument("--n-tasks",    type=int, default=500,
+    parser.add_argument(
+        "--inp-checkpoint", type=str, required=True,
+        help="Path to INP (stage-2) model_best.pt",
+    )
+    parser.add_argument(
+        "--np-checkpoint", type=str, default=None,
+        help="Path to NP (stage-1) model_best.pt. "
+             "If provided, evaluates both and prints comparison table.",
+    )
+    parser.add_argument("--config", type=str, required=True,
+                        help="Path to config TOML")
+    parser.add_argument("--n-tasks", type=int, default=500,
                         help="Number of test episodes (paper uses 500)")
     parser.add_argument("--n-bootstrap", type=int, default=1000,
                         help="Bootstrap resamples for std error")
-    parser.add_argument("--batch-size", type=int, default=16,
-                        help="Batch size for test DataLoader")
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--seed",       type=int, default=42,
+    parser.add_argument("--seed", type=int, default=42,
                         help="Seed for reproducible test episodes")
-    parser.add_argument("--output-json", type=str, default="test_results.json",
-                        help="Where to save results JSON")
-    parser.add_argument("--also-eval-np", action="store_true",
-                        help="Also evaluate with knowledge masked (NP baseline)")
+    parser.add_argument("--output-json", type=str, default="test_results.json")
     args = parser.parse_args()
 
     device = get_device()
@@ -188,20 +280,23 @@ def main():
     config = Config.from_toml(args.config)
     config.device = device
 
-    # ── Load CLIP ──────────────────────────────────────────────────────────────
+    # ── Load CLIP (shared across both models) ──────────────────────────────────
     import open_clip
     clip_model, _, _ = open_clip.create_model_and_transforms(
         "ViT-B-32", pretrained="openai"
     )
     clip_model = clip_model.to(device)
-    tokenizer  = open_clip.get_tokenizer("ViT-B-32")
+    tokenizer = open_clip.get_tokenizer("ViT-B-32")
 
-    # ── Load model ─────────────────────────────────────────────────────────────
-    model = INP_MedClassification(config, clip_model, tokenizer)
-    state_dict = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(state_dict, strict=False)
-    model.to(device)
-    print(f"Loaded checkpoint: {args.checkpoint}")
+    # ── Load INP model (stage 2) ──────────────────────────────────────────────
+    print(f"\nLoading INP checkpoint: {args.inp_checkpoint}")
+    inp_model = load_model(config, clip_model, tokenizer, args.inp_checkpoint, device)
+
+    # ── Optionally load NP model (stage 1) — separate instance ────────────────
+    np_model = None
+    if args.np_checkpoint is not None:
+        print(f"Loading NP checkpoint:  {args.np_checkpoint}")
+        np_model = load_model(config, clip_model, tokenizer, args.np_checkpoint, device)
 
     # ── Build test DataLoader ──────────────────────────────────────────────────
     test_ds = ISICEpisodicDataset(
@@ -209,11 +304,11 @@ def main():
         data_root=getattr(config, "data_root", "data/isic2019"),
         encoder=getattr(config, "encoder_type", "clip"),
         n_ways=getattr(config, "n_ways", None),
-        min_shots=10,                  # provide enough context to subsample from
+        min_shots=10,              # always provide 10 shots to subsample from
         max_shots=10,
         num_query=getattr(config, "num_targets", 20),
         n_episodes=args.n_tasks,
-        use_knowledge=True,            # always load descriptions; we mask in eval
+        use_knowledge=True,        # always load descriptions; masking is per-model
         seed=args.seed,
     )
     test_dl = DataLoader(
@@ -226,29 +321,30 @@ def main():
     )
 
     print(f"\nTest classes: {SPLIT_CLASSES['test']}")
-    print(f"N-ways: {config.n_ways}  |  Test tasks: {args.n_tasks}\n")
+    print(f"N-ways: {config.n_ways}  |  Test tasks: {args.n_tasks}")
 
     shot_settings = [0, 1, 3, 5, 10]
 
-
     # ── Evaluate INP (with knowledge) ─────────────────────────────────────────
-    print("=" * 60)
-    print("Evaluating INP (with knowledge)...")
+    print("\n" + "=" * 60)
+    print("Evaluating INP (stage-2, with knowledge)...")
     print("=" * 60)
     inp_results = evaluate_checkpoint(
-        model, test_dl, shot_settings,
+        inp_model, test_dl, shot_settings,
         n_ways=config.n_ways,
         use_knowledge=True,
         device=device,
         n_bootstrap=args.n_bootstrap,
     )
 
-    # ── Optionally evaluate NP baseline (knowledge masked) ────────────────────
+    # ── Evaluate NP baseline (separate stage-1 model, no knowledge) ───────────
     np_results = None
-    if args.also_eval_np:
-        print("\nEvaluating NP baseline (knowledge masked)...")
+    if np_model is not None:
+        print("\n" + "=" * 60)
+        print("Evaluating NP (stage-1, no knowledge)...")
+        print("=" * 60)
         np_results = evaluate_checkpoint(
-            model, test_dl, shot_settings,
+            np_model, test_dl, shot_settings,
             n_ways=config.n_ways,
             use_knowledge=False,
             device=device,
@@ -256,36 +352,15 @@ def main():
         )
 
     # ── Print table ───────────────────────────────────────────────────────────
-    print("\n")
-    print("=" * 60)
-    print(f"  Final Test Results  ({args.n_tasks} tasks, {config.n_ways}-way)")
-    print("=" * 60)
-
-    if np_results is not None:
-        header = f"{'k':>4}  {'NP (%)':>14}  {'INP (%)':>14}"
-    else:
-        header = f"{'k':>4}  {'INP (%)':>14}"
-    print(header)
-    print("-" * len(header))
-
-    for k in shot_settings:
-        inp_m  = inp_results[k]["mean"]
-        inp_se = inp_results[k]["stderr"]
-        if np_results is not None:
-            np_m  = np_results[k]["mean"]
-            np_se = np_results[k]["stderr"]
-            print(f"{k:>4}  {np_m:>8.1f} ({np_se:.1f})  {inp_m:>8.1f} ({inp_se:.1f})")
-        else:
-            print(f"{k:>4}  {inp_m:>8.1f} ({inp_se:.1f})")
-
-    print("=" * 60)
-    print("Format: mean (bootstrap stderr), both in %")
+    print_table(shot_settings, inp_results, np_results,
+                n_tasks=args.n_tasks, n_ways=config.n_ways)
 
     # ── Save JSON ─────────────────────────────────────────────────────────────
     output = {
-        "checkpoint": args.checkpoint,
-        "n_tasks":    args.n_tasks,
-        "n_ways":     config.n_ways,
+        "inp_checkpoint": args.inp_checkpoint,
+        "np_checkpoint": args.np_checkpoint,
+        "n_tasks": args.n_tasks,
+        "n_ways": config.n_ways,
         "test_classes": SPLIT_CLASSES["test"],
         "shot_settings": shot_settings,
         "INP": {str(k): v for k, v in inp_results.items()},
@@ -300,6 +375,26 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
