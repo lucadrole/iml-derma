@@ -33,7 +33,7 @@ echo "  which python: $(which python || echo 'none')"
 echo "  python --version: $(python --version 2>&1 || echo 'none')"
 
 # WandB
-export WANDB_API_KEY="21eec93d4b125e6132dbf2900d9ba82240aef3aa"
+export WANDB_API_KEY=""
 export WANDB_ENTITY=lucadrole-eth-zurich
 export WANDB_PROJECT=INPs_isic_dermnet
 export WANDB_MODE=online
